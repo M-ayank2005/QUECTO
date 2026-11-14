@@ -128,7 +128,7 @@ export default function RegisterShopPage() {
 
           <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
             <a
-              href="http://localhost:3001"
+              href={process.env.NEXT_PUBLIC_ADMIN_URL || "http://localhost:3001"}
               target="_blank"
               rel="noopener noreferrer"
               className="px-8 py-3.5 rounded-2xl glass-button-primary text-slate-950 font-bold text-xs flex items-center justify-center gap-2 shadow-lg w-full sm:w-auto"

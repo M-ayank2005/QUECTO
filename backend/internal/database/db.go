@@ -28,7 +28,6 @@ func CheckPasswordHash(password, hash string) bool {
 	return err == nil
 }
 
-
 type DBService struct {
 	DB     *sql.DB
 	IsMock bool
@@ -64,6 +63,7 @@ func InitDB(databaseURL string) (*DBService, error) {
 				service.IsMock = false
 				GlobalDB = service
 				runMigrations(db)
+				service.syncWithPostgres(db)
 				return service, nil
 			} else {
 				log.Printf("Warning: Ping to NeonDB failed: %v. Running in in-memory resilient mode.", ctxErr)
@@ -79,6 +79,164 @@ func InitDB(databaseURL string) (*DBService, error) {
 	service.seedMockData()
 	GlobalDB = service
 	return service, nil
+}
+
+func (s *DBService) syncWithPostgres(db *sql.DB) {
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM shops").Scan(&count)
+	if err != nil {
+		log.Printf("Warning: Failed to query shop count from NeonDB: %v", err)
+	}
+
+	if count == 0 {
+		log.Println("NeonDB tables are empty. Seeding initial Quecto catalog, merchants, and sample data into PostgreSQL...")
+		s.seedMockData()
+
+		for _, shop := range s.shops {
+			apartments := strings.Join(shop.ServedApartments, ",")
+			_, err := db.Exec(`
+				INSERT INTO shops (id, name, category, address, city, phone, rating, delivery_fee, min_order, is_open, image_url, latitude, longitude, delivery_radius_km, visibility, served_apartments, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+				ON CONFLICT (id) DO NOTHING
+			`, shop.ID, shop.Name, shop.Category, shop.Address, shop.City, shop.Phone, shop.Rating, shop.DeliveryFee, shop.MinOrder, shop.IsOpen, shop.ImageURL, shop.Latitude, shop.Longitude, shop.DeliveryRadiusKm, shop.Visibility, apartments, shop.CreatedAt)
+			if err != nil {
+				log.Printf("Error inserting initial shop %s: %v", shop.ID, err)
+			}
+		}
+
+		for _, prod := range s.prods {
+			_, err := db.Exec(`
+				INSERT INTO products (id, shop_id, name, description, category, price, unit, stock, in_stock, image_url, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				ON CONFLICT (id) DO NOTHING
+			`, prod.ID, prod.ShopID, prod.Name, prod.Description, prod.Category, prod.Price, prod.Unit, prod.Stock, prod.InStock, prod.ImageURL, prod.CreatedAt)
+			if err != nil {
+				log.Printf("Error inserting initial prod %s: %v", prod.ID, err)
+			}
+		}
+
+		for _, ord := range s.orders {
+			_, err := db.Exec(`
+				INSERT INTO orders (id, shop_id, customer_id, customer_email, customer_name, customer_phone, delivery_address, total_amount, payment_method, payment_status, order_status, notes, tracking_token, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+				ON CONFLICT (id) DO NOTHING
+			`, ord.ID, ord.ShopID, ord.CustomerID, ord.CustomerEmail, ord.CustomerName, ord.CustomerPhone, ord.DeliveryAddress, ord.TotalAmount, ord.PaymentMethod, ord.PaymentStatus, ord.OrderStatus, ord.Notes, ord.TrackingToken, ord.CreatedAt)
+			if err != nil {
+				log.Printf("Error inserting initial order %s: %v", ord.ID, err)
+			}
+			for _, item := range ord.Items {
+				_, _ = db.Exec(`
+					INSERT INTO order_items (order_id, product_id, product_name, quantity, price)
+					VALUES ($1, $2, $3, $4, $5)
+				`, ord.ID, item.ProductID, item.ProductName, item.Quantity, item.Price)
+			}
+		}
+
+		for _, u := range s.users {
+			_, err := db.Exec(`
+				INSERT INTO users (id, email, password, password_hash, name, phone, role, shop_id, society, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				ON CONFLICT (email) DO NOTHING
+			`, u.ID, u.Email, u.Password, u.PasswordHash, u.Name, u.Phone, u.Role, u.ShopID, u.Society, u.CreatedAt)
+			if err != nil {
+				log.Printf("Error inserting initial user %s: %v", u.Email, err)
+			}
+		}
+		log.Println("Initial data seeded into NeonDB PostgreSQL successfully.")
+	} else {
+		log.Println("NeonDB contains existing data. Loading catalog and records into server state...")
+		s.loadFromPostgres(db)
+	}
+}
+
+func (s *DBService) loadFromPostgres(db *sql.DB) {
+	s.mockMu.Lock()
+	defer s.mockMu.Unlock()
+
+	// Load shops
+	shopRows, err := db.Query(`
+		SELECT id, name, category, address, city, phone, rating, delivery_fee, min_order, is_open, image_url, COALESCE(latitude, 26.85), COALESCE(longitude, 80.99), COALESCE(delivery_radius_km, 5.0), COALESCE(visibility, 'public'), COALESCE(served_apartments, ''), created_at
+		FROM shops
+	`)
+	if err == nil {
+		defer shopRows.Close()
+		for shopRows.Next() {
+			var sh models.Shop
+			var aptsStr string
+			if err := shopRows.Scan(&sh.ID, &sh.Name, &sh.Category, &sh.Address, &sh.City, &sh.Phone, &sh.Rating, &sh.DeliveryFee, &sh.MinOrder, &sh.IsOpen, &sh.ImageURL, &sh.Latitude, &sh.Longitude, &sh.DeliveryRadiusKm, &sh.Visibility, &aptsStr, &sh.CreatedAt); err == nil {
+				if aptsStr != "" {
+					sh.ServedApartments = strings.Split(aptsStr, ",")
+				} else {
+					sh.ServedApartments = []string{}
+				}
+				s.shops[sh.ID] = &sh
+			}
+		}
+	}
+
+	// Load products
+	prodRows, err := db.Query(`
+		SELECT id, shop_id, name, description, category, price, unit, stock, in_stock, image_url, created_at
+		FROM products
+	`)
+	if err == nil {
+		defer prodRows.Close()
+		for prodRows.Next() {
+			var p models.Product
+			if err := prodRows.Scan(&p.ID, &p.ShopID, &p.Name, &p.Description, &p.Category, &p.Price, &p.Unit, &p.Stock, &p.InStock, &p.ImageURL, &p.CreatedAt); err == nil {
+				s.prods[p.ID] = &p
+			}
+		}
+	}
+
+	// Load orders
+	ordRows, err := db.Query(`
+		SELECT id, shop_id, COALESCE(customer_id, ''), COALESCE(customer_email, ''), customer_name, customer_phone, delivery_address, total_amount, payment_method, payment_status, order_status, COALESCE(notes, ''), COALESCE(tracking_token, ''), created_at
+		FROM orders
+	`)
+	if err == nil {
+		defer ordRows.Close()
+		for ordRows.Next() {
+			var o models.Order
+			if err := ordRows.Scan(&o.ID, &o.ShopID, &o.CustomerID, &o.CustomerEmail, &o.CustomerName, &o.CustomerPhone, &o.DeliveryAddress, &o.TotalAmount, &o.PaymentMethod, &o.PaymentStatus, &o.OrderStatus, &o.Notes, &o.TrackingToken, &o.CreatedAt); err == nil {
+				s.orders[o.ID] = &o
+			}
+		}
+	}
+
+	// Load order_items
+	itemRows, err := db.Query(`
+		SELECT id, order_id, product_id, product_name, quantity, price
+		FROM order_items
+	`)
+	if err == nil {
+		defer itemRows.Close()
+		for itemRows.Next() {
+			var it models.OrderItem
+			if err := itemRows.Scan(&it.ID, &it.OrderID, &it.ProductID, &it.ProductName, &it.Quantity, &it.Price); err == nil {
+				if ord, exists := s.orders[it.OrderID]; exists {
+					ord.Items = append(ord.Items, it)
+				}
+			}
+		}
+	}
+
+	// Load users
+	userRows, err := db.Query(`
+		SELECT id, email, COALESCE(password, ''), COALESCE(password_hash, ''), name, COALESCE(phone, ''), role, COALESCE(shop_id, ''), COALESCE(society, ''), created_at
+		FROM users
+	`)
+	if err == nil {
+		defer userRows.Close()
+		for userRows.Next() {
+			var u models.User
+			if err := userRows.Scan(&u.ID, &u.Email, &u.Password, &u.PasswordHash, &u.Name, &u.Phone, &u.Role, &u.ShopID, &u.Society, &u.CreatedAt); err == nil {
+				s.users[u.Email] = &u
+			}
+		}
+	}
+
+	log.Printf("Successfully loaded %d shops, %d products, %d orders, and %d users from NeonDB.", len(s.shops), len(s.prods), len(s.orders), len(s.users))
 }
 
 func (s *DBService) seedMockData() {
@@ -305,7 +463,6 @@ func (s *DBService) seedMockData() {
 		s.prods[prod.ID] = prod
 	}
 
-	// Sample orders
 	sampleOrder := &models.Order{
 		ID:              "ORD-1001",
 		ShopID:          "shop-1",
@@ -317,6 +474,7 @@ func (s *DBService) seedMockData() {
 		PaymentStatus:   "pending",
 		OrderStatus:     "accepted",
 		Notes:           "Elderly resident, please ring bell twice.",
+		TrackingToken:   "trk_sample_1001",
 		CreatedAt:       time.Now().Add(-45 * time.Minute),
 		Items: []models.OrderItem{
 			{ProductID: "prod-1", ProductName: "Aashirvaad Shudh Chakki Atta", Quantity: 1, Price: 245.00},
@@ -328,7 +486,6 @@ func (s *DBService) seedMockData() {
 	}
 	s.orders[sampleOrder.ID] = sampleOrder
 
-	// Seed initial merchant and customer users with bcrypt hashed passwords
 	defaultAdminHash, _ := HashPassword("admin123")
 	defaultCustHash, _ := HashPassword("customer123")
 	masterHQHash, _ := HashPassword("quectomaster2026")
@@ -360,6 +517,11 @@ func runMigrations(db *sql.DB) {
 		min_order NUMERIC(10,2) DEFAULT 99.00,
 		is_open BOOLEAN DEFAULT TRUE,
 		image_url TEXT,
+		latitude DOUBLE PRECISION DEFAULT 26.85,
+		longitude DOUBLE PRECISION DEFAULT 80.99,
+		delivery_radius_km DOUBLE PRECISION DEFAULT 5.0,
+		visibility VARCHAR(50) DEFAULT 'public',
+		served_apartments TEXT DEFAULT '',
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 	);
 
@@ -380,6 +542,8 @@ func runMigrations(db *sql.DB) {
 	CREATE TABLE IF NOT EXISTS orders (
 		id VARCHAR(64) PRIMARY KEY,
 		shop_id VARCHAR(64) REFERENCES shops(id),
+		customer_id VARCHAR(64),
+		customer_email VARCHAR(255),
 		customer_name VARCHAR(255) NOT NULL,
 		customer_phone VARCHAR(20) NOT NULL,
 		delivery_address TEXT NOT NULL,
@@ -388,6 +552,7 @@ func runMigrations(db *sql.DB) {
 		payment_status VARCHAR(20) DEFAULT 'pending',
 		order_status VARCHAR(50) DEFAULT 'pending',
 		notes TEXT,
+		tracking_token VARCHAR(128),
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 	);
 
@@ -399,6 +564,29 @@ func runMigrations(db *sql.DB) {
 		quantity INT NOT NULL,
 		price NUMERIC(10,2) NOT NULL
 	);
+
+	CREATE TABLE IF NOT EXISTS users (
+		id VARCHAR(64) PRIMARY KEY,
+		email VARCHAR(255) UNIQUE NOT NULL,
+		password VARCHAR(255),
+		password_hash VARCHAR(255),
+		name VARCHAR(255) NOT NULL,
+		phone VARCHAR(50),
+		role VARCHAR(50) NOT NULL DEFAULT 'customer',
+		shop_id VARCHAR(64),
+		society VARCHAR(255),
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+	);
+
+	ALTER TABLE shops ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION DEFAULT 26.85;
+	ALTER TABLE shops ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION DEFAULT 80.99;
+	ALTER TABLE shops ADD COLUMN IF NOT EXISTS delivery_radius_km DOUBLE PRECISION DEFAULT 5.0;
+	ALTER TABLE shops ADD COLUMN IF NOT EXISTS visibility VARCHAR(50) DEFAULT 'public';
+	ALTER TABLE shops ADD COLUMN IF NOT EXISTS served_apartments TEXT DEFAULT '';
+
+	ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_id VARCHAR(64);
+	ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_email VARCHAR(255);
+	ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_token VARCHAR(128);
 	`
 	_, err := db.Exec(ddl)
 	if err != nil {
@@ -408,7 +596,7 @@ func runMigrations(db *sql.DB) {
 	}
 }
 
-// In-Memory Data Accessors
+// In-Memory & Database Data Accessors
 func (s *DBService) GetAllShops() []*models.Shop {
 	s.mockMu.RLock()
 	defer s.mockMu.RUnlock()
@@ -447,6 +635,20 @@ func (s *DBService) AddProduct(p *models.Product) *models.Product {
 	p.CreatedAt = time.Now()
 	p.InStock = p.Stock > 0
 	s.prods[p.ID] = p
+
+	if s.DB != nil {
+		go func(prod models.Product) {
+			_, err := s.DB.Exec(`
+				INSERT INTO products (id, shop_id, name, description, category, price, unit, stock, in_stock, image_url, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				ON CONFLICT (id) DO UPDATE SET name = $3, description = $4, category = $5, price = $6, unit = $7, stock = $8, in_stock = $9, image_url = $10
+			`, prod.ID, prod.ShopID, prod.Name, prod.Description, prod.Category, prod.Price, prod.Unit, prod.Stock, prod.InStock, prod.ImageURL, prod.CreatedAt)
+			if err != nil {
+				log.Printf("Error persisting product to Postgres: %v", err)
+			}
+		}(*p)
+	}
+
 	return p
 }
 
@@ -473,6 +675,18 @@ func (s *DBService) UpdateProduct(id string, update *models.Product) (*models.Pr
 	if update.Unit != "" {
 		prod.Unit = update.Unit
 	}
+
+	if s.DB != nil {
+		go func(p models.Product) {
+			_, err := s.DB.Exec(`
+				UPDATE products SET name = $1, price = $2, stock = $3, in_stock = $4, category = $5, unit = $6 WHERE id = $7
+			`, p.Name, p.Price, p.Stock, p.InStock, p.Category, p.Unit, p.ID)
+			if err != nil {
+				log.Printf("Error updating product in Postgres: %v", err)
+			}
+		}(*prod)
+	}
+
 	return prod, true
 }
 
@@ -481,6 +695,14 @@ func (s *DBService) DeleteProduct(id string) bool {
 	defer s.mockMu.Unlock()
 	if _, ok := s.prods[id]; ok {
 		delete(s.prods, id)
+		if s.DB != nil {
+			go func(delID string) {
+				_, err := s.DB.Exec(`DELETE FROM products WHERE id = $1`, delID)
+				if err != nil {
+					log.Printf("Error deleting product from Postgres: %v", err)
+				}
+			}(id)
+		}
 		return true
 	}
 	return false
@@ -515,6 +737,25 @@ func (s *DBService) CreateOrder(req *models.CreateOrderRequest) *models.Order {
 		Items:           req.Items,
 	}
 	s.orders[orderID] = order
+
+	if s.DB != nil {
+		go func(ord models.Order) {
+			_, err := s.DB.Exec(`
+				INSERT INTO orders (id, shop_id, customer_id, customer_email, customer_name, customer_phone, delivery_address, total_amount, payment_method, payment_status, order_status, notes, tracking_token, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			`, ord.ID, ord.ShopID, ord.CustomerID, ord.CustomerEmail, ord.CustomerName, ord.CustomerPhone, ord.DeliveryAddress, ord.TotalAmount, ord.PaymentMethod, ord.PaymentStatus, ord.OrderStatus, ord.Notes, ord.TrackingToken, ord.CreatedAt)
+			if err != nil {
+				log.Printf("Error saving order to Postgres: %v", err)
+			}
+			for _, item := range ord.Items {
+				_, _ = s.DB.Exec(`
+					INSERT INTO order_items (order_id, product_id, product_name, quantity, price)
+					VALUES ($1, $2, $3, $4, $5)
+				`, ord.ID, item.ProductID, item.ProductName, item.Quantity, item.Price)
+			}
+		}(*order)
+	}
+
 	return order
 }
 
@@ -552,6 +793,16 @@ func (s *DBService) UpdateOrderStatus(id, newStatus string) (*models.Order, bool
 	if newStatus == "delivered" {
 		ord.PaymentStatus = "completed"
 	}
+
+	if s.DB != nil {
+		go func(ordID, status, payStatus string) {
+			_, err := s.DB.Exec(`UPDATE orders SET order_status = $1, payment_status = $2 WHERE id = $3`, status, payStatus, ordID)
+			if err != nil {
+				log.Printf("Error updating order status in Postgres: %v", err)
+			}
+		}(id, newStatus, ord.PaymentStatus)
+	}
+
 	return ord, true
 }
 
@@ -657,6 +908,18 @@ func (s *DBService) UpdateShopSettings(shopID string, update *models.Shop) (*mod
 	}
 	shop.IsOpen = update.IsOpen
 
+	if s.DB != nil {
+		go func(sh models.Shop) {
+			apts := strings.Join(sh.ServedApartments, ",")
+			_, err := s.DB.Exec(`
+				UPDATE shops SET name = $1, category = $2, phone = $3, address = $4, city = $5, delivery_fee = $6, min_order = $7, is_open = $8, delivery_radius_km = $9, visibility = $10, served_apartments = $11 WHERE id = $12
+			`, sh.Name, sh.Category, sh.Phone, sh.Address, sh.City, sh.DeliveryFee, sh.MinOrder, sh.IsOpen, sh.DeliveryRadiusKm, sh.Visibility, apts, sh.ID)
+			if err != nil {
+				log.Printf("Error updating shop in Postgres: %v", err)
+			}
+		}(*shop)
+	}
+
 	return shop, true
 }
 
@@ -676,6 +939,20 @@ func (s *DBService) CreateUser(u *models.User) (*models.User, error) {
 	}
 	u.CreatedAt = time.Now()
 	s.users[u.Email] = u
+
+	if s.DB != nil {
+		go func(user models.User) {
+			_, err := s.DB.Exec(`
+				INSERT INTO users (id, email, password, password_hash, name, phone, role, shop_id, society, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				ON CONFLICT (email) DO NOTHING
+			`, user.ID, user.Email, user.Password, user.PasswordHash, user.Name, user.Phone, user.Role, user.ShopID, user.Society, user.CreatedAt)
+			if err != nil {
+				log.Printf("Error creating user in Postgres: %v", err)
+			}
+		}(*u)
+	}
+
 	return u, nil
 }
 
@@ -770,6 +1047,23 @@ func (s *DBService) RegisterShop(req *models.RegisterShopRequest) (*models.Shop,
 	}
 	s.users[req.OwnerEmail] = adminUser
 
+	if s.DB != nil {
+		go func(sh models.Shop, user models.User) {
+			apts := strings.Join(sh.ServedApartments, ",")
+			_, _ = s.DB.Exec(`
+				INSERT INTO shops (id, name, category, address, city, phone, rating, delivery_fee, min_order, is_open, image_url, latitude, longitude, delivery_radius_km, visibility, served_apartments, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+				ON CONFLICT (id) DO NOTHING
+			`, sh.ID, sh.Name, sh.Category, sh.Address, sh.City, sh.Phone, sh.Rating, sh.DeliveryFee, sh.MinOrder, sh.IsOpen, sh.ImageURL, sh.Latitude, sh.Longitude, sh.DeliveryRadiusKm, sh.Visibility, apts, sh.CreatedAt)
+
+			_, _ = s.DB.Exec(`
+				INSERT INTO users (id, email, password, password_hash, name, phone, role, shop_id, society, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				ON CONFLICT (email) DO NOTHING
+			`, user.ID, user.Email, user.Password, user.PasswordHash, user.Name, user.Phone, user.Role, user.ShopID, user.Society, user.CreatedAt)
+		}(*shop, *adminUser)
+	}
+
 	return shop, adminUser, nil
 }
 
@@ -791,7 +1085,6 @@ func (s *DBService) UpdateShopPassword(shopID string, oldPassword, newPassword s
 		return fmt.Errorf("store account for shop '%s' not found", shopID)
 	}
 
-	// Verify old password (check bcrypt hash first, fallback to plain text)
 	valid := false
 	if targetUser.PasswordHash != "" {
 		valid = CheckPasswordHash(oldPassword, targetUser.PasswordHash)
@@ -813,6 +1106,13 @@ func (s *DBService) UpdateShopPassword(shopID string, oldPassword, newPassword s
 
 	targetUser.Password = newPassword
 	targetUser.PasswordHash = newHash
+
+	if s.DB != nil {
+		go func(shID, pass, hash string) {
+			_, _ = s.DB.Exec(`UPDATE users SET password = $1, password_hash = $2 WHERE LOWER(shop_id) = LOWER($3)`, pass, hash, shID)
+		}(shopID, newPassword, newHash)
+	}
+
 	return nil
 }
 
@@ -891,8 +1191,12 @@ func (s *DBService) OverrideOrderStatus(orderID, newStatus string) (*models.Orde
 		order.PaymentStatus = "completed"
 	}
 	order.Notes = fmt.Sprintf("%s [Quecto Ops Status Override: %s at %s]", order.Notes, newStatus, time.Now().Format("15:04:05"))
+
+	if s.DB != nil {
+		go func(id, status, payStatus, notes string) {
+			_, _ = s.DB.Exec(`UPDATE orders SET order_status = $1, payment_status = $2, notes = $3 WHERE id = $4`, status, payStatus, notes, id)
+		}(orderID, newStatus, order.PaymentStatus, order.Notes)
+	}
+
 	return order, nil
 }
-
-
-

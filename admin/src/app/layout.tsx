@@ -282,7 +282,7 @@ function AdminShell({ children }: { children: React.ReactNode }) {
           <div className="pt-2 text-center text-xs text-slate-400 border-t border-white/5">
             <span>Want to onboard a new store? </span>
             <a
-              href="http://localhost:3000/register-shop"
+              href={`${process.env.NEXT_PUBLIC_CONSUMER_URL || "http://localhost:3000"}/register-shop`}
               className="text-emerald-400 font-bold hover:underline"
             >
               Register Your Shop with Quecto →
@@ -382,7 +382,7 @@ function AdminShell({ children }: { children: React.ReactNode }) {
         {/* Bottom Footer & Logout */}
         <div className="space-y-3 pt-4 border-t border-white/10">
           <a
-            href="http://localhost:3000"
+            href={process.env.NEXT_PUBLIC_CONSUMER_URL || "http://localhost:3000"}
             target="_blank"
             rel="noopener noreferrer"
             className="w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-semibold text-slate-300 hover:text-white bg-white/[0.03] hover:bg-white/[0.08] border border-white/5 transition-all"

@@ -93,7 +93,7 @@ export default function HomePage() {
               </Link>
               <span>•</span>
               <a
-                href="http://localhost:3001"
+                href={process.env.NEXT_PUBLIC_ADMIN_URL || "http://localhost:3001"}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-slate-300 hover:text-white font-semibold hover:underline"
@@ -313,7 +313,7 @@ export default function HomePage() {
               <ArrowRight className="w-3.5 h-3.5" />
             </Link>
             <a
-              href="http://localhost:3001"
+              href={process.env.NEXT_PUBLIC_ADMIN_URL || "http://localhost:3001"}
               target="_blank"
               rel="noopener noreferrer"
               className="px-4 py-2.5 rounded-xl glass-button-secondary text-slate-300 hover:text-white font-semibold text-xs text-center"

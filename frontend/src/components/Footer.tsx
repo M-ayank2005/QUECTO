@@ -63,7 +63,7 @@ export default function Footer() {
               </li>
               <li>
                 <a
-                  href="http://localhost:3001"
+                  href={process.env.NEXT_PUBLIC_ADMIN_URL || "http://localhost:3001"}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="hover:text-emerald-400 transition-colors flex items-center gap-1.5 font-medium text-slate-300"
